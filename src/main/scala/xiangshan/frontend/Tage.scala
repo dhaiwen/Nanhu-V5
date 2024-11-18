@@ -117,8 +117,8 @@ class TageMeta(implicit p: Parameters)
 {
   val providers = Vec(numBr, ValidUndirectioned(UInt(log2Ceil(TageNTables).W)))
   val providerResps = Vec(numBr, new TageResp_meta)
-  // val altProviders = Vec(numBr, ValidUndirectioned(UInt(log2Ceil(TageNTables).W)))
-  // val altProviderResps = Vec(numBr, new TageResp)
+  val altProviders = Vec(numBr, ValidUndirectioned(UInt(log2Ceil(TageNTables).W)))
+  val altProviderResps = Vec(numBr, new TageResp)
   val altUsed = Vec(numBr, Bool())
   val basecnts = Vec(numBr, UInt(2.W))
   val allocates = Vec(numBr, UInt(TageNTables.W))
@@ -163,6 +163,7 @@ class TageBTable(implicit p: Parameters) extends XSModule with TBTParams{
       shouldReset = false,
       holdRead = true,
       bypassWrite = true
+      // singlePort = true
     ))
 
   val wrbypass = Module(new WrBypass(UInt(2.W), bypassEntries, log2Up(BtSize), numWays = numBr, extraPort = Some(true))) // logical bridx
@@ -597,9 +598,9 @@ class Tage(implicit p: Parameters) extends BaseTage {
   val s1_provideds        = Wire(Vec(numBr, Bool()))
   val s1_providers        = Wire(Vec(numBr, UInt(log2Ceil(TageNTables).W)))
   val s1_providerResps    = Wire(Vec(numBr, new TageResp))
-  // val s1_altProvideds     = Wire(Vec(numBr, Bool()))
-  // val s1_altProviders     = Wire(Vec(numBr, UInt(log2Ceil(TageNTables).W)))
-  // val s1_altProviderResps = Wire(Vec(numBr, new TageResp))
+  val s1_altProvideds     = Wire(Vec(numBr, Bool()))
+  val s1_altProviders     = Wire(Vec(numBr, UInt(log2Ceil(TageNTables).W)))
+  val s1_altProviderResps = Wire(Vec(numBr, new TageResp))
   val s1_altUsed          = Wire(Vec(numBr, Bool()))
   val s1_tageTakens       = Wire(Vec(numBr, Bool()))
   val s1_basecnts         = Wire(Vec(numBr, UInt(2.W)))
@@ -608,9 +609,9 @@ class Tage(implicit p: Parameters) extends BaseTage {
   val s2_provideds        = RegEnable(s1_provideds, io.s1_fire(1))
   val s2_providers        = RegEnable(s1_providers, io.s1_fire(1))
   val s2_providerResps    = RegEnable(s1_providerResps, io.s1_fire(1))
-  // val s2_altProvideds     = RegEnable(s1_altProvideds, io.s1_fire)
-  // val s2_altProviders     = RegEnable(s1_altProviders, io.s1_fire)
-  // val s2_altProviderResps = RegEnable(s1_altProviderResps, io.s1_fire)
+  val s2_altProvideds     = RegEnable(s1_altProvideds, io.s1_fire(1))
+  val s2_altProviders     = RegEnable(s1_altProviders, io.s1_fire(1))
+  val s2_altProviderResps = RegEnable(s1_altProviderResps, io.s1_fire(1))
   val s2_altUsed          = RegEnable(s1_altUsed, io.s1_fire(1))
   val s2_tageTakens_dup   = io.s1_fire.map(f => RegEnable(s1_tageTakens, f))
   val s2_basecnts         = RegEnable(s1_basecnts, io.s1_fire(1))
@@ -670,12 +671,23 @@ class Tage(implicit p: Parameters) extends BaseTage {
     // val altProvided = selectedInfo.hasTwo
     // val providerInfo = selectedInfo
     // val altProviderInfo = selectedInfo.second
+    //alter
+    val s1ProviderIdx = providerInfo.tableIdx
+    val s1ProviderOH  = UIntToOH(s1ProviderIdx, TageNTables).asBools
+    val s1AltValidVec = inputRes.zip(s1ProviderOH).map{case(in, mask) => in._1 & ~mask}
+    val s1AltIdx      = ParallelPriorityMux(s1AltValidVec.reverse, inputRes.map(_._2.tableIdx))
+    val s1AltResp     = ParallelPriorityMux(s1AltValidVec.reverse, inputRes.map(_._2.resp))
+    val s1IsAlt       = s1AltValidVec.reduce(_||_)
+
     s1_provideds(i)      := provided
     s1_providers(i)      := providerInfo.tableIdx
     s1_providerResps(i)  := providerInfo.resp
     // s1_altProvideds(i)   := altProvided
     // s1_altProviders(i)   := altProviderInfo.tableIdx
     // s1_altProviderResps(i) := altProviderInfo.resp
+    s1_altProvideds(i)   := s1IsAlt //altProvided
+    s1_altProviders(i)   := s1AltIdx //altProviderInfo.tableIdx
+    s1_altProviderResps(i) := s1AltResp //altProviderInfo.resp
 
     resp_meta.providers(i).valid    := RegEnable(s2_provideds(i), io.s2_fire(1))
     resp_meta.providers(i).bits     := RegEnable(s2_providers(i), io.s2_fire(1))
@@ -683,6 +695,9 @@ class Tage(implicit p: Parameters) extends BaseTage {
     // resp_meta.altProviders(i).valid := RegEnable(s2_altProvideds(i), io.s2_fire)
     // resp_meta.altProviders(i).bits  := RegEnable(s2_altProviders(i), io.s2_fire)
     // resp_meta.altProviderResps(i)   := RegEnable(s2_altProviderResps(i), io.s2_fire)
+    resp_meta.altProviders(i).valid := RegEnable(s2_altProvideds(i), io.s2_fire(1))
+    resp_meta.altProviders(i).bits  := RegEnable(s2_altProviders(i), io.s2_fire(1))
+    resp_meta.altProviderResps(i)   := RegEnable(s2_altProviderResps(i), io.s2_fire(1))
     resp_meta.pred_cycle.map(_ := RegEnable(GTimer(), io.s2_fire(1)))
     resp_meta.use_alt_on_na.map(_(i) := RegEnable(s2_useAltOnNa(i), io.s2_fire(1)))
 
@@ -726,7 +741,19 @@ class Tage(implicit p: Parameters) extends BaseTage {
     val updateProvided     = updateMeta.providers(i).valid
     val updateProvider     = updateMeta.providers(i).bits
     val updateProviderResp = updateMeta.providerResps(i)
-    val updateProviderCorrect = updateProviderResp.ctr(TageCtrBits-1) === updateTaken
+    // val updateProviderCorrect = updateProviderResp.ctr(TageCtrBits-1) === updateTaken
+    val updateProviderCorrect = WireDefault(updateProviderResp.u)
+    when(updateMeta.altProviders(i).valid &&
+    updateProviderResp.ctr(TageCtrBits-1) =/= updateMeta.altProviderResps(i).ctr(TageCtrBits-1)) {
+      when(updateProviderResp.ctr(TageCtrBits-1) === updateTaken) {
+        updateProviderCorrect := true.B
+      }.otherwise {
+        updateProviderCorrect := false.B
+      }
+    }.elsewhen(!updateMeta.altProviders(i).valid) {
+      updateProviderCorrect := updateProviderResp.ctr(TageCtrBits-1) === updateTaken
+    }
+
     val updateUseAlt = updateMeta.altUsed(i)
     val updateAltDiffers = updateMeta.altDiffers(i)
     val updateAltIdx = use_alt_idx(update.pc)
