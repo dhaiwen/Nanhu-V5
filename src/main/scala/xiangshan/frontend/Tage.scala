@@ -678,7 +678,7 @@ class Tage(implicit p: Parameters) extends BaseTage {
     val providerUnconf = unconf(providerInfo.resp.ctr)
     // val s1_bimCtr = bt.io.s1_cnt(i)
     s1_tageTakens(i)     := Mux1H(Seq(
-      (provided && !providerUnconf, providerInfo.resp.ctr(TageCtrBits-1)),
+      (provided && !(providerUnconf && altProvided), providerInfo.resp.ctr(TageCtrBits-1)),
       (altProvided && providerUnconf, altProviderInfo.resp.ctr(TageCtrBits-1)),
       (!provided, bt.io.s1_cnt(i)(1))
     ))
@@ -711,7 +711,7 @@ class Tage(implicit p: Parameters) extends BaseTage {
     val updateAltProvider     = updateMeta.altProviders(i).bits
     val updateAltProviderResp = updateMeta.altProviderResps(i)
     
-    val updateProviderCorrect = updateProviderResp.ctr(TageCtrBits-1) === updateTaken
+    // val updateProviderCorrect = updateProviderResp.ctr(TageCtrBits-1) === updateTaken
     // val updateAltDiffers = updateMeta.altDiffers(i)
     val updateProviderWeakTaken = posUnconf(updateProviderResp.ctr)
     val updateProviderWeaknotTaken = negUnconf(updateProviderResp.ctr)
@@ -765,7 +765,8 @@ class Tage(implicit p: Parameters) extends BaseTage {
     updatebcnt(i) := updateMeta.basecnts(i)
     bUpdateTakens(i) := updateTaken
 
-    val needToAllocate = hasUpdate && updateMispred && !(updateProviderWeaknotTaken && updateProviderCorrect && updateProvided)
+    // val needToAllocate = hasUpdate && updateMispred && !(updateProviderWeaknotTaken && updateProviderCorrect && updateProvided)
+    val needToAllocate = hasUpdate && updateMispred && !((updateProviderWeaknotTaken && !updateTaken || updateProviderWeakTaken && updateTaken) && updateProvided)
     val allocatableMask = updateMeta.allocates(i)
     val canAllocate = updateMeta.allocateValid(i)
 
