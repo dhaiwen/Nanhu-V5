@@ -36,6 +36,7 @@ trait TageParams extends HasBPUConst with HasXSParameter {
   val TageCtrBits = 3
   val TickWidth = 7
 
+  
   val USE_ALT_ON_NA_WIDTH = 4
   val NUM_USE_ALT_ON_NA = 128
   def use_alt_idx(pc: UInt) = (pc >> instOffsetBits)(log2Ceil(NUM_USE_ALT_ON_NA)-1, 0)
@@ -246,6 +247,9 @@ class TageBTable(implicit p: Parameters) extends XSModule with TBTParams{
   val wrbypass_write_waymask = wrbypass.io.update_way_mask.get
   wrbypass.io.conflict_clean.get := can_write
 
+  XSPerfAccumulate(f"tage_bt_table_read_req", s0_fire)
+  XSPerfAccumulate(f"tage_bt_table_write_conflict", io.update_mask.reduce(_||_) && s0_fire)
+
   bt.io.w.apply(
     valid = ((io.update_mask.reduce(_||_) || doing_reset) && !write_conflict) || can_write,
     data = Mux(can_write, wrbypass_write_data, Mux(doing_reset, VecInit(Seq.fill(numBr)(2.U(2.W))), newCtrs)), // Weak taken
@@ -272,7 +276,6 @@ class TageTable
     val ctr = UInt(TageCtrBits.W)
   }
 
-
   // Physical SRAM size
   val bankSRAMSize = 512
   val uSRAMSize = 256
@@ -289,6 +292,21 @@ class TageTable
   val bankIdxWidth = log2Ceil(nBanks)
   def get_bank_mask(idx: UInt) = VecInit((0 until nBanks).map(idx(bankIdxWidth-1, 0) === _.U))
   def get_bank_idx(idx: UInt) = idx >> bankIdxWidth
+
+  class TageWriteQueueUpdate(implicit p: Parameters) extends TageBundle {
+    val update_unhashed_idx = UInt(VAddrBits.W)
+    val update_idx = UInt(log2Ceil(nRowsPerBr).W)
+    val update_tag = UInt(tagLen.W)
+    // update tag and ctr
+    val mask = Vec(numBr, Bool())
+    val takens = Vec(numBr, Bool())
+    val alloc = Vec(numBr, Bool())
+    val oldCtrs = Vec(numBr, UInt(TageCtrBits.W))
+    // update u
+    val uMask = Vec(numBr, Bool())
+    val us = Vec(numBr, Bool())
+    val reset_u = Vec(numBr, Bool())
+  }
 
 
   // bypass entries for tage update
@@ -324,14 +342,42 @@ class TageTable
 
   // val s1_pc = io.req.bits.pc
   val req_unhashed_idx = getUnhashedIdx(io.req.bits.pc)
+  val wirte_buffer_queue_TageUpdate = WireInit(0.U.asTypeOf(new TageWriteQueueUpdate))
+  // Use fetchpc to compute hash
+  val update_folded_hist = WireInit(0.U.asTypeOf(new AllFoldedHistories(foldedGHistInfos)))
+  update_folded_hist.getHistWithInfo(idxFhInfo).folded_hist := compute_folded_ghist(io.update.ghist, log2Ceil(nRowsPerBr))
+  update_folded_hist.getHistWithInfo(tagFhInfo).folded_hist := compute_folded_ghist(io.update.ghist, tagLen)
+  update_folded_hist.getHistWithInfo(altTagFhInfo).folded_hist := compute_folded_ghist(io.update.ghist, tagLen-1)
+
+  val per_bank_update_wdata = Wire(Vec(nBanks, Vec(numBr, new TageEntry))) // corresponds to physical branches
+
+  val update_unhashed_idx = getUnhashedIdx(io.update.pc)
+  val (update_idx, update_tag) = compute_tag_and_hash(update_unhashed_idx, update_folded_hist)
+
+  val wirte_buffer_queue = Module(new Queue (new TageWriteQueueUpdate, entries = 16, pipe = true, flow = true))
+    wirte_buffer_queue.io.enq.valid := io.update.mask.reduce(_||_)
+    wirte_buffer_queue.io.enq.bits.update_unhashed_idx := update_unhashed_idx// save for reorder
+    wirte_buffer_queue.io.enq.bits.update_idx := update_idx//save update_idx
+    wirte_buffer_queue.io.enq.bits.update_tag := update_tag//save update_tag
+    wirte_buffer_queue.io.enq.bits.mask := io.update.mask
+    wirte_buffer_queue.io.enq.bits.takens := io.update.takens
+    wirte_buffer_queue.io.enq.bits.alloc := io.update.alloc
+    wirte_buffer_queue.io.enq.bits.oldCtrs := io.update.oldCtrs
+    wirte_buffer_queue.io.enq.bits.uMask := io.update.uMask
+    wirte_buffer_queue.io.enq.bits.us := io.update.us
+    wirte_buffer_queue.io.enq.bits.reset_u := io.update.reset_u
+
+  val buffer_full = wirte_buffer_queue.full
+  val buffer_empty = wirte_buffer_queue.empty
+
+  // XSPerfAccumulate(f"tage_table_buffer_full", buffer_full)
+  // XSPerfAccumulate(f"tage_table_buffer_empty", buffer_empty)
 
   val us = Module(new FoldedSRAMTemplate(Bool(), set=nRowsPerBr, width=uFoldedWidth, way=numBr, shouldReset=true, extraReset=true, holdRead=true, singlePort=true))
-  us.extra_reset.get := io.update.reset_u.reduce(_||_) && io.update.mask.reduce(_||_)
-
+  us.extra_reset.get := wirte_buffer_queue_TageUpdate.reset_u.reduce(_||_) && wirte_buffer_queue_TageUpdate.mask.reduce(_||_)
 
   val table_banks = Seq.fill(nBanks)(
     Module(new FoldedSRAMTemplate(new TageEntry, set=bankSize, width=bankFoldWidth, way=numBr, shouldReset=true, holdRead=true, singlePort=true)))
-
 
   val (s0_idx, s0_tag) = compute_tag_and_hash(req_unhashed_idx, io.req.bits.folded_hist)
   val s0_bank_req_1h = get_bank_mask(s0_idx)
@@ -350,18 +396,18 @@ class TageTable
   val s1_tag = RegEnable(s0_tag, io.req.fire)
   val s1_pc  = RegEnable(io.req.bits.pc, io.req.fire)
   val s1_bank_req_1h = RegEnable(s0_bank_req_1h, io.req.fire)
-  val s1_bank_has_write_on_this_req = RegEnable(VecInit(table_banks.map(_.io.w.req.valid)), io.req.valid)
+  // val s1_bank_has_write_on_this_req = RegEnable(VecInit(table_banks.map(_.io.w.req.valid)), io.req.valid)
 
-  val resp_invalid_by_write = Wire(Bool())
+  // val resp_invalid_by_write = Wire(Bool())
 
   val tables_r = table_banks.map(_.io.r.resp.data) // s1
   val unconfs = tables_r.map(r => VecInit(r.map(e => WireInit(unconf(e.ctr))))) // do unconf cal in parallel
-  val hits = tables_r.map(r => VecInit(r.map(e => e.tag === s1_tag && e.valid && !resp_invalid_by_write))) // do tag compare in parallel
+  val hits = tables_r.map(r => VecInit(r.map(e => e.tag === s1_tag && e.valid))) // do tag compare in parallel
 
   val resp_selected = Mux1H(s1_bank_req_1h, tables_r)
   val unconf_selected = Mux1H(s1_bank_req_1h, unconfs)
   val hit_selected = Mux1H(s1_bank_req_1h, hits)
-  resp_invalid_by_write := Mux1H(s1_bank_req_1h, s1_bank_has_write_on_this_req)
+  // resp_invalid_by_write := Mux1H(s1_bank_req_1h, s1_bank_has_write_on_this_req)
 
 
   val per_br_resp = VecInit((0 until numBr).map(i => Mux1H(UIntToOH(get_phy_br_idx(s1_unhashed_idx, i), numBr), resp_selected)))
@@ -376,18 +422,8 @@ class TageTable
     io.resps(i).bits.unconf := per_br_unconf(i)
   }
 
-  // Use fetchpc to compute hash
-  val update_folded_hist = WireInit(0.U.asTypeOf(new AllFoldedHistories(foldedGHistInfos)))
-  update_folded_hist.getHistWithInfo(idxFhInfo).folded_hist := compute_folded_ghist(io.update.ghist, log2Ceil(nRowsPerBr))
-  update_folded_hist.getHistWithInfo(tagFhInfo).folded_hist := compute_folded_ghist(io.update.ghist, tagLen)
-  update_folded_hist.getHistWithInfo(altTagFhInfo).folded_hist := compute_folded_ghist(io.update.ghist, tagLen-1)
-
-  val per_bank_update_wdata = Wire(Vec(nBanks, Vec(numBr, new TageEntry))) // corresponds to physical branches
-
-  val update_unhashed_idx = getUnhashedIdx(io.update.pc)
-  val (update_idx, update_tag) = compute_tag_and_hash(update_unhashed_idx, update_folded_hist)
-  val update_req_bank_1h = get_bank_mask(update_idx)
-  val update_idx_in_bank = get_bank_idx(update_idx)
+  val update_req_bank_1h = get_bank_mask(wirte_buffer_queue_TageUpdate.update_idx)
+  val update_idx_in_bank = get_bank_idx(wirte_buffer_queue_TageUpdate.update_idx)
 
   val per_bank_not_silent_update = Wire(Vec(nBanks, Vec(numBr, Bool()))) // corresponds to physical branches
   val per_bank_update_way_mask =
@@ -395,16 +431,35 @@ class TageTable
       VecInit((0 until numBr).map(pi => {
         // whether any of the logical branches updates on each slot
         Seq.tabulate(numBr)(li =>
-          get_phy_br_idx(update_unhashed_idx, li) === pi.U &&
-          io.update.mask(li)).reduce(_||_) && per_bank_not_silent_update(b)(pi)
+          get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li) === pi.U &&
+          wirte_buffer_queue_TageUpdate.mask(li)).reduce(_||_) && per_bank_not_silent_update(b)(pi)
       })).asUInt
     ))
+
+
+  // val bank_conflict = (0 until nBanks).map(b => table_banks(b).io.w.req.valid && s0_bank_req_1h(b)).reduce(_||_)
+  val bank_conflict = (0 until nBanks).map(b => per_bank_update_way_mask(b).orR && update_req_bank_1h(b) && s0_bank_req_1h(b) && io.req.fire).reduce(_||_)
+  XSPerfAccumulate(f"tage_table_bank_conflict", bank_conflict)
+  XSPerfAccumulate(f"tage_table_read_req", io.req.fire)
+
+  when(wirte_buffer_queue.io.deq.valid && (!bank_conflict)) {
+      wirte_buffer_queue_TageUpdate := wirte_buffer_queue.io.deq.bits
+      wirte_buffer_queue.io.deq.ready := true.B
+    }.otherwise {
+      wirte_buffer_queue_TageUpdate := wirte_buffer_queue.io.deq.bits // 当队列为空时，输出默认值
+      wirte_buffer_queue.io.deq.ready := false.B
+    }
+
+  // when(buffer_full && (io.update.mask.reduce(_||_)) ){
+  //   wirte_buffer_queue.last.valid := io.update.mask.reduce(_||_)
+  //   wirte_buffer_queue.last.bits := io.update
+  // }
 
   // val silent_update_from_wrbypass = Wire(Bool())
 
   for (b <- 0 until nBanks) {
     table_banks(b).io.w.apply(
-      valid   = per_bank_update_way_mask(b).orR && update_req_bank_1h(b),
+      valid   = per_bank_update_way_mask(b).orR && update_req_bank_1h(b) && !bank_conflict,
       data    = per_bank_update_wdata(b),
       setIdx  = update_idx_in_bank,
       waymask = per_bank_update_way_mask(b)
@@ -422,24 +477,21 @@ class TageTable
   // We do not want write request block the whole BPU pipeline
   io.req.ready := !powerOnResetState
 
-  val bank_conflict = (0 until nBanks).map(b => table_banks(b).io.w.req.valid && s0_bank_req_1h(b)).reduce(_||_)
-  XSPerfAccumulate(f"tage_table_bank_conflict", bank_conflict)
-
-  val update_u_idx = update_idx
+  val update_u_idx = wirte_buffer_queue_TageUpdate.update_idx
   val update_u_way_mask = VecInit((0 until numBr).map(pi => {
     Seq.tabulate(numBr)(li =>
-      get_phy_br_idx(update_unhashed_idx, li) === pi.U &&
-      io.update.uMask(li)
+      get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li) === pi.U &&
+      wirte_buffer_queue_TageUpdate.uMask(li)
     ).reduce(_||_)
   })).asUInt
 
   val update_u_wdata = VecInit((0 until numBr).map(pi =>
     Mux1H(Seq.tabulate(numBr)(li =>
-      (get_phy_br_idx(update_unhashed_idx, li) === pi.U, io.update.us(li))
+      (get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li) === pi.U, wirte_buffer_queue_TageUpdate.us(li))
     ))
   ))
 
-  us.io.w.apply(io.update.mask.reduce(_||_) && io.update.uMask.reduce(_||_), update_u_wdata, update_u_idx, update_u_way_mask)
+  us.io.w.apply(wirte_buffer_queue_TageUpdate.mask.reduce(_||_) && wirte_buffer_queue_TageUpdate.uMask.reduce(_||_) && !bank_conflict, update_u_wdata, update_u_idx, update_u_way_mask)
 
   // remove silent updates
   def silentUpdate(ctr: UInt, taken: Bool) = {
@@ -450,39 +502,41 @@ class TageTable
     Module(new WrBypass(UInt(TageCtrBits.W), perBankWrbypassEntries, log2Ceil(bankSize)))
   )) // let it corresponds to logical brIdx
 
+
   for (b <- 0 until nBanks) {
     val not_silent_update = per_bank_not_silent_update(b)
     for (pi <- 0 until numBr) { // physical brIdx
       val update_wdata = per_bank_update_wdata(b)(pi)
-      val br_lidx = get_lgc_br_idx(update_unhashed_idx, pi.U(log2Ceil(numBr).W))
+      val br_lidx = get_lgc_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, pi.U(log2Ceil(numBr).W))
       // this
       val wrbypass_io = Mux1H(UIntToOH(br_lidx, numBr), bank_wrbypasses(b).map(_.io))
       val wrbypass_hit = wrbypass_io.hit
       val wrbypass_ctr = wrbypass_io.hit_data(0).bits
       val wrbypass_data_valid = wrbypass_hit && wrbypass_io.hit_data(0).valid
       update_wdata.ctr :=
-        Mux(io.update.alloc(br_lidx),
-          Mux(io.update.takens(br_lidx), 4.U, 3.U),
+        Mux(wirte_buffer_queue_TageUpdate.alloc(br_lidx),
+          Mux(wirte_buffer_queue_TageUpdate.takens(br_lidx), 4.U, 3.U),
           Mux(wrbypass_data_valid,
-            inc_ctr(wrbypass_ctr,               io.update.takens(br_lidx)),
-            inc_ctr(io.update.oldCtrs(br_lidx), io.update.takens(br_lidx))
+            inc_ctr(wrbypass_ctr,               wirte_buffer_queue_TageUpdate.takens(br_lidx)),
+            inc_ctr(wirte_buffer_queue_TageUpdate.oldCtrs(br_lidx), wirte_buffer_queue_TageUpdate.takens(br_lidx))
           )
         )
-      not_silent_update(pi) :=
+      not_silent_update(pi) :=  
+      // !silentUpdate(wirte_buffer_queue_TageUpdate.oldCtrs(br_lidx), wirte_buffer_queue_TageUpdate.takens(br_lidx)) || wirte_buffer_queue_TageUpdate.alloc(br_lidx)
         Mux(wrbypass_data_valid,
-          !silentUpdate(wrbypass_ctr,               io.update.takens(br_lidx)),
-          !silentUpdate(io.update.oldCtrs(br_lidx), io.update.takens(br_lidx))) ||
-        io.update.alloc(br_lidx)
-
+          !silentUpdate(wrbypass_ctr,               wirte_buffer_queue_TageUpdate.takens(br_lidx)),
+          !silentUpdate(wirte_buffer_queue_TageUpdate.oldCtrs(br_lidx), wirte_buffer_queue_TageUpdate.takens(br_lidx)) ||
+        wirte_buffer_queue_TageUpdate.alloc(br_lidx)
+        )
       update_wdata.valid := true.B
-      update_wdata.tag   := update_tag
+      update_wdata.tag   := wirte_buffer_queue_TageUpdate.update_tag
     }
 
     for (li <- 0 until numBr) {
       val wrbypass = bank_wrbypasses(b)(li)
-      val br_pidx = get_phy_br_idx(update_unhashed_idx, li)
-      wrbypass.io.wen := io.update.mask(li) && update_req_bank_1h(b)
-      wrbypass.io.write_idx := get_bank_idx(update_idx)
+      val br_pidx = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li)
+      wrbypass.io.wen := wirte_buffer_queue_TageUpdate.mask(li) && update_req_bank_1h(b) && !bank_conflict
+      wrbypass.io.write_idx := get_bank_idx(wirte_buffer_queue_TageUpdate.update_idx)
       wrbypass.io.write_data(0) := Mux1H(UIntToOH(br_pidx, numBr), per_bank_update_wdata(b)).ctr
     }
   }
@@ -509,7 +563,7 @@ class TageTable
     XSPerfAccumulate(f"tage_table_bank_${b}_update_req", io.update.mask.reduce(_||_) && update_req_bank_1h(b))
     for (i <- 0 until numBr) {
       val li = i
-      val pidx = get_phy_br_idx(update_unhashed_idx, li)
+      val pidx = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li)
       XSPerfAccumulate(f"tage_table_bank_${b}_br_li_${li}_updated", table_banks(b).io.w.req.valid && table_banks(b).io.w.req.bits.waymask.get(pidx))
       val pi = i
       XSPerfAccumulate(f"tage_table_bank_${b}_br_pi_${pi}_updated", table_banks(b).io.w.req.valid && table_banks(b).io.w.req.bits.waymask.get(pi))
@@ -530,16 +584,16 @@ class TageTable
       p"update Table_br_$i: pc:${Hexadecimal(u.pc)}}, " +
       p"taken:${u.takens(i)}, alloc:${u.alloc(i)}, oldCtrs:${u.oldCtrs(i)}\n")
     val bank = OHToUInt(update_req_bank_1h.asUInt, nBanks)
-    val pi = get_phy_br_idx(update_unhashed_idx, i)
+    val pi = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, i)
     XSDebug(io.update.mask(i),
       p"update Table_$i: writing tag:$update_tag, " +
-      p"ctr: ${per_bank_update_wdata(bank)(pi).ctr} in idx ${update_idx}\n")
+      p"ctr: ${per_bank_update_wdata(bank)(pi).ctr} in idx ${wirte_buffer_queue_TageUpdate.update_idx}\n")
     XSDebug(RegNext(io.req.fire) && !per_br_hit(i), p"TageTableResp_$i: not hit!\n")
   }
 
   // ------------------------------Debug-------------------------------------
   val valids = RegInit(VecInit(Seq.fill(nRowsPerBr)(false.B)))
-  when (io.update.mask.reduce(_||_)) { valids(update_idx) := true.B }
+  when (io.update.mask.reduce(_||_)) { valids(wirte_buffer_queue_TageUpdate.update_idx) := true.B }
   XSDebug("Table usage:------------------------\n")
   XSDebug("%d out of %d rows are valid\n", PopCount(valids), nRowsPerBr.U)
 
