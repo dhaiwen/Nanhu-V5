@@ -294,7 +294,7 @@ class TageTable
   def get_bank_idx(idx: UInt) = idx >> bankIdxWidth
 
   class TageWriteQueueUpdate(implicit p: Parameters) extends TageBundle {
-    val update_unhashed_idx = UInt(VAddrBits.W)
+    val update_unhashed_idx_cut = UInt(log2Ceil(numBr).W)
     val update_idx = UInt(log2Ceil(nRowsPerBr).W)
     val update_tag = UInt(tagLen.W)
     // update tag and ctr
@@ -356,7 +356,7 @@ class TageTable
 
   val wirte_buffer_queue = Module(new Queue (new TageWriteQueueUpdate, entries = 16, pipe = true, flow = true))
     wirte_buffer_queue.io.enq.valid := io.update.mask.reduce(_||_)
-    wirte_buffer_queue.io.enq.bits.update_unhashed_idx := update_unhashed_idx// save for reorder
+    wirte_buffer_queue.io.enq.bits.update_unhashed_idx_cut := update_unhashed_idx(log2Ceil(numBr)-1)// save for reorder
     wirte_buffer_queue.io.enq.bits.update_idx := update_idx//save update_idx
     wirte_buffer_queue.io.enq.bits.update_tag := update_tag//save update_tag
     wirte_buffer_queue.io.enq.bits.mask := io.update.mask
@@ -431,7 +431,7 @@ class TageTable
       VecInit((0 until numBr).map(pi => {
         // whether any of the logical branches updates on each slot
         Seq.tabulate(numBr)(li =>
-          get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li) === pi.U &&
+          get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, li) === pi.U &&
           wirte_buffer_queue_TageUpdate.mask(li)).reduce(_||_) && per_bank_not_silent_update(b)(pi)
       })).asUInt
     ))
@@ -480,14 +480,14 @@ class TageTable
   val update_u_idx = wirte_buffer_queue_TageUpdate.update_idx
   val update_u_way_mask = VecInit((0 until numBr).map(pi => {
     Seq.tabulate(numBr)(li =>
-      get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li) === pi.U &&
+      get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, li) === pi.U &&
       wirte_buffer_queue_TageUpdate.uMask(li)
     ).reduce(_||_)
   })).asUInt
 
   val update_u_wdata = VecInit((0 until numBr).map(pi =>
     Mux1H(Seq.tabulate(numBr)(li =>
-      (get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li) === pi.U, wirte_buffer_queue_TageUpdate.us(li))
+      (get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, li) === pi.U, wirte_buffer_queue_TageUpdate.us(li))
     ))
   ))
 
@@ -507,7 +507,7 @@ class TageTable
     val not_silent_update = per_bank_not_silent_update(b)
     for (pi <- 0 until numBr) { // physical brIdx
       val update_wdata = per_bank_update_wdata(b)(pi)
-      val br_lidx = get_lgc_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, pi.U(log2Ceil(numBr).W))
+      val br_lidx = get_lgc_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, pi.U(log2Ceil(numBr).W))
       // this
       val wrbypass_io = Mux1H(UIntToOH(br_lidx, numBr), bank_wrbypasses(b).map(_.io))
       val wrbypass_hit = wrbypass_io.hit
@@ -534,7 +534,7 @@ class TageTable
 
     for (li <- 0 until numBr) {
       val wrbypass = bank_wrbypasses(b)(li)
-      val br_pidx = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li)
+      val br_pidx = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, li)
       wrbypass.io.wen := wirte_buffer_queue_TageUpdate.mask(li) && update_req_bank_1h(b) && !bank_conflict
       wrbypass.io.write_idx := get_bank_idx(wirte_buffer_queue_TageUpdate.update_idx)
       wrbypass.io.write_data(0) := Mux1H(UIntToOH(br_pidx, numBr), per_bank_update_wdata(b)).ctr
@@ -563,7 +563,7 @@ class TageTable
     XSPerfAccumulate(f"tage_table_bank_${b}_update_req", io.update.mask.reduce(_||_) && update_req_bank_1h(b))
     for (i <- 0 until numBr) {
       val li = i
-      val pidx = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, li)
+      val pidx = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, li)
       XSPerfAccumulate(f"tage_table_bank_${b}_br_li_${li}_updated", table_banks(b).io.w.req.valid && table_banks(b).io.w.req.bits.waymask.get(pidx))
       val pi = i
       XSPerfAccumulate(f"tage_table_bank_${b}_br_pi_${pi}_updated", table_banks(b).io.w.req.valid && table_banks(b).io.w.req.bits.waymask.get(pi))
@@ -584,7 +584,7 @@ class TageTable
       p"update Table_br_$i: pc:${Hexadecimal(u.pc)}}, " +
       p"taken:${u.takens(i)}, alloc:${u.alloc(i)}, oldCtrs:${u.oldCtrs(i)}\n")
     val bank = OHToUInt(update_req_bank_1h.asUInt, nBanks)
-    val pi = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx, i)
+    val pi = get_phy_br_idx(wirte_buffer_queue_TageUpdate.update_unhashed_idx_cut, i)
     XSDebug(io.update.mask(i),
       p"update Table_$i: writing tag:$update_tag, " +
       p"ctr: ${per_bank_update_wdata(bank)(pi).ctr} in idx ${wirte_buffer_queue_TageUpdate.update_idx}\n")
